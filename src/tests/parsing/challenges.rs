@@ -240,6 +240,13 @@ fn challenge_provide() {
                     - /usr/bin/zsh
         "#,
         )?;
+        jail.create_file(dir.join("foo.txt"), "foo")?;
+
+        jail.create_file(dir.join("bar.txt"), "foo")?;
+        jail.create_file(dir.join("baz.txt"), "foo")?;
+
+        jail.create_file(dir.join("ducks.txt"), "foo")?;
+        jail.create_file(dir.join("beavers.txt"), "foo")?;
 
         let chals = parse_all().unwrap();
 

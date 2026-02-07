@@ -7,6 +7,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use serde_nested_with::serde_nested;
 use std::collections::HashMap as Map;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tracing::{debug, error, info, trace, warn};
@@ -51,12 +52,14 @@ pub fn parse_all() -> Result<Vec<ChallengeConfig>, Vec<Error>> {
 }
 
 pub fn parse_one(path: &PathBuf) -> Result<ChallengeConfig> {
+    dbg!(&path);
     trace!("trying to parse {path:?}");
 
     // remove 'challenge.yaml' from path
     let chal_dir = path
         .parent()
-        .expect("could not extract path from search path");
+        .expect("could not extract path from search path")
+        .to_owned();
 
     // extract category from challenge path
     let category = chal_dir
@@ -65,59 +68,22 @@ pub fn parse_one(path: &PathBuf) -> Result<ChallengeConfig> {
         .expect("could not find category from path")
         .as_os_str()
         .to_str()
-        .unwrap();
+        .unwrap()
+        .to_owned();
 
-    let mut parsed: ChallengeConfig = Figment::new()
-        .merge(Yaml::file(path.clone()))
-        // merge in generated data from file path
-        .merge(Serialized::default("directory", chal_dir))
-        .merge(Serialized::default("category", category))
-        .extract()?;
+    let f = File::open(path)?;
+    let raw: RawChallengeConfig = serde_yaml_ng::from_reader(f)?;
+    dbg!(&raw);
+    trace!("got challenge config: {raw:#?}");
 
-    // coerce pod env lists to maps
-    // TODO: do this in serde deserialize?
-    for pod in parsed.pods.iter_mut() {
-        pod.env = match pod.env.clone() {
-            ListOrMap::Map(m) => ListOrMap::Map(m),
-            ListOrMap::List(l) => {
-                // split NAME=VALUE list into separate name and value
-                let split: Vec<(String, String)> = l
-                    .into_iter()
-                    .map(|var| {
-                        // error if envvar is malformed
-                        let split = var.splitn(2, '=').collect_vec();
-                        if split.len() == 2 {
-                            Ok((split[0].to_string(), split[1].to_string()))
-                        } else {
-                            Err(anyhow!("Cannot split envvar {var:?}"))
-                        }
-                    })
-                    .collect::<Result<_>>()?;
-                // build hashmap from split name and value iteratively. this
-                // can't use HashMap::from() here since the values are dynamic
-                // and from() only works for Vec constants
-                let map = split
-                    .into_iter()
-                    .fold(Map::new(), |mut map, (name, value)| {
-                        map.insert(name, value);
-                        map
-                    });
-                ListOrMap::Map(map)
-            }
-        }
-    }
-
-    trace!("got challenge config: {parsed:#?}");
-
-    Ok(parsed)
+    ChallengeConfig::from_raw(raw, chal_dir, category)
 }
 
 //
 // ==== Structs for challenge.yaml parsing ====
 //
 
-#[serde_nested]
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize)]
 #[fully_pub]
 pub struct ChallengeConfig {
     name: String,
@@ -156,17 +122,13 @@ pub struct ChallengeConfig {
 
     directory: PathBuf,
 
-    #[serde(default = "default_difficulty")]
     difficulty: i64,
 
     flag: FlagType,
 
-    #[serde(default)]
     // map deserialize_with to type in vec
-    #[serde_nested(sub = "ProvideConfig", serde(deserialize_with = "string_or_struct"))]
     provide: Vec<ProvideConfig>, // optional if no files provided
 
-    #[serde(default)]
     pods: Vec<Pod>, // optional if no containers used
 }
 impl ChallengeConfig {
@@ -219,6 +181,148 @@ impl ChallengeConfig {
             .to_lowercase()
             .split_whitespace()
             .join("-")
+    }
+}
+impl ChallengeConfig {
+    fn from_raw(
+        mut value: RawChallengeConfig,
+        directory: PathBuf,
+        category: String,
+    ) -> Result<Self> {
+        let glob_expanded_provides = RawChallengeConfig::process_local_paths(value.provide)?;
+
+        // coerce pod env lists to maps
+        // TODO: do this in serde deserialize?
+        for pod in value.pods.iter_mut() {
+            pod.env = match pod.env.clone() {
+                ListOrMap::Map(m) => ListOrMap::Map(m),
+                ListOrMap::List(l) => {
+                    // split NAME=VALUE list into separate name and value
+                    let split: Vec<(String, String)> = l
+                        .into_iter()
+                        .map(|var| {
+                            // error if envvar is malformed
+                            let split = var.splitn(2, '=').collect_vec();
+                            if split.len() == 2 {
+                                Ok((split[0].to_string(), split[1].to_string()))
+                            } else {
+                                Err(anyhow!("Cannot split envvar {var:?}"))
+                            }
+                        })
+                        .collect::<Result<_>>()?;
+                    // build hashmap from split name and value iteratively. this
+                    // can't use HashMap::from() here since the values are dynamic
+                    // and from() only works for Vec constants
+                    let map = split
+                        .into_iter()
+                        .fold(Map::new(), |mut map, (name, value)| {
+                            map.insert(name, value);
+                            map
+                        });
+                    ListOrMap::Map(map)
+                }
+            }
+        }
+
+        Ok(Self {
+            name: value.name,
+            author: value.author,
+            description: value.description,
+            category,
+            directory,
+            difficulty: value.difficulty,
+            flag: value.flag,
+            provide: glob_expanded_provides,
+            pods: value.pods,
+        })
+    }
+}
+
+#[serde_nested]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+/// Represents a proto-[`ChallengeConfig`] as read from disk
+/// before the [`ProvideConfig`] has been glob-expanded & validated
+struct RawChallengeConfig {
+    name: String,
+    author: String,
+    description: String,
+
+    #[serde(default = "default_difficulty")]
+    difficulty: i64,
+
+    flag: FlagType,
+
+    #[serde(default)]
+    // map deserialize_with to type in vec
+    #[serde_nested(sub = "ProvideConfig", serde(deserialize_with = "string_or_struct"))]
+    provide: Vec<ProvideConfig>, // optional if no files provided
+
+    #[serde(default)]
+    pods: Vec<Pod>, // optional if no containers used
+}
+impl RawChallengeConfig {
+    fn process_local_paths(
+        provide: Vec<ProvideConfig>,
+    ) -> Result<Vec<ProvideConfig>, anyhow::Error> {
+        let mut processed_pconfs: Vec<ProvideConfig> = Vec::new();
+        let mut container_provides = false;
+
+        for pconf in provide.into_iter() {
+            if pconf.is_container() {
+                container_provides = true;
+            }
+
+            match pconf {
+                ProvideConfig::FromRepo { files } => {
+                    let expanded_files = RawChallengeConfig::process_all_globs(&files)?;
+                    processed_pconfs.push(ProvideConfig::FromRepo {
+                        files: expanded_files,
+                    });
+                }
+                ProvideConfig::FromRepoArchive {
+                    files,
+                    archive_name,
+                } => {
+                    let expanded_files = RawChallengeConfig::process_all_globs(&files)?;
+                    processed_pconfs.push(ProvideConfig::FromRepoArchive {
+                        files: expanded_files,
+                        archive_name,
+                    })
+                }
+                // All container provides and FromRepoRename can't be processed
+                other => processed_pconfs.push(other),
+            }
+        }
+
+        if container_provides {
+            warn!(
+                "Parsed container provides. Any present globs will not be processed until build step."
+            );
+        }
+        Ok(processed_pconfs)
+    }
+
+    /// Expand globs in all local paths into a single combined array
+    fn process_all_globs(files: &[PathBuf]) -> Result<Vec<PathBuf>, anyhow::Error> {
+        files.iter().try_fold(Vec::new(), |mut acc, f| {
+            let paths = RawChallengeConfig::process_one_glob(f)?;
+            acc.extend(paths);
+            Ok::<Vec<PathBuf>, anyhow::Error>(acc)
+        })
+    }
+
+    /// Expand one path into potentially many by running a glob on local
+    /// filesystem.
+    ///
+    /// Implictly checks for file existance and accessability.
+    fn process_one_glob(file: &Path) -> Result<Vec<PathBuf>, anyhow::Error> {
+        // FIXME: This should take &str, treating the filename at this point like pathbuf is bad semantics
+        // but we're not exporting these bad semantics outside this module to be fair
+        let pattern = file.to_string_lossy();
+        // TODO: will need more context!
+        let paths = glob(&pattern)?.collect::<Result<Vec<_>, _>>()?;
+        dbg!(&pattern, &paths);
+        Ok(paths)
     }
 }
 
@@ -302,6 +406,19 @@ impl FromStr for ProvideConfig {
         Ok(ProvideConfig::FromRepo {
             files: vec![PathBuf::from(s)],
         })
+    }
+}
+impl ProvideConfig {
+    /// Check whether variant refers to files to be extracted from container instead of in repo
+    fn is_container(&self) -> bool {
+        match self {
+            Self::FromRepo { .. } | Self::FromRepoArchive { .. } | Self::FromRepoRename { .. } => {
+                false
+            }
+            Self::FromContainer { .. }
+            | Self::FromContainerArchive { .. }
+            | Self::FromContainerRename { .. } => true,
+        }
     }
 }
 
